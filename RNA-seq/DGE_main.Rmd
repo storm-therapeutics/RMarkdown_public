@@ -1,0 +1,212 @@
+---
+title: Differential gene expression report
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float:
+      collapsed: true
+      smooth_scroll: false
+params:
+  base_dir: "C:/Users/hendrik.weisser/OneDrive - Storm Therapeutics/Data/STC15_Tempus"
+  out_dir: "" # directory for output files (GSEA results)
+  deseq2_rds: "DESeq2.rds" # input data (e.g. result from 'DESeqDataSetFromMatrix')
+  contrasts: null # list of contrasts to extract from DESeq2 results
+  plot_vars: ["subject", "time_id"] # grouping variables to show in plots
+  group_size: "subject" # metadata variable to determine group size for filtering (or number for group size directly)
+  volcano_fc: 1.5 # fold-change cut-off for volcano plots
+  plot_top_degs: 20
+  no_gsea: false # skip GSEA (slow)?
+  gsea_pmax: 0.1 # adj. p-value cut-off for GSEA
+  reuse_output: false
+  toolkit_dir: "C:/Users/hendrik.weisser/Code/BiomarkerDiscoveryToolkit"
+---
+<!-- move content to the left -->
+<style>
+.main-container {
+    max-width: 100% !important;
+}
+</style>
+
+<!-- avoid blank space to the right of TOC: -->
+```{js page_format, echo=FALSE}
+// from:
+// https://www.reddit.com/r/rstats/comments/qlbst0/comment/jsg550p
+
+// TOC column
+const TOC_col = document.querySelector('div.row>div:not(div+div)');  // First div element under div.row
+TOC_col.classList.replace('col-sm-4', 'col-sm-2');  // sm: Change TOC column width from 33% to 17% of total
+TOC_col.classList.replace('col-md-3', 'col-md-2');  // md: Change TOC column width from 25% to 17% of total
+
+// Main column
+const main_col = document.querySelector('div.row>div+div');  // Second (and last) div element under div.row
+main_col.classList.replace('col-sm-8', 'col-sm-10');  // sm: Change main column width from 67% to 83% of total
+main_col.classList.replace('col-md-9', 'col-md-10');  // md: Change main column width from 75% to 83% of total
+main_col.classList.add('col-sm-offset-2', 'col-md-offset-2')  // sm+md: offset main column by width of TOC
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=FALSE)
+## library(knitr)
+library(DT) # add data download buttons to tables
+library(dplyr)
+library(tidyr)
+library(DESeq2)
+library(pheatmap)
+library(EnhancedVolcano) # used in child document 'nanostring_dge_contrast.Rmd'
+## pathway/enrichment analysis:
+library(org.Hs.eg.db)
+library(clusterProfiler)
+library(ReactomePA)
+library(msigdbr)
+
+source(file.path(params$toolkit_dir, "R/enrichment.R")) # for GSEA
+## ggplot theme:
+theme_set(theme_bw() + theme(plot.title=element_text(hjust=0.5, face="bold"), plot.subtitle=element_text(hjust=0.5)))
+
+## wrapper function to create table with CSV download button:
+make.table <- function(data, filename, options=list(), ...) {
+  ## if only showing one button, need an extra 'list(...)' in the 'buttons' argument:
+  opts <- c(dom="Bfrtip", buttons=list(list(list(extend="csv", filename=filename))), options)
+  datatable(data, extensions="Buttons", options=opts, ...)
+}
+```
+
+`r Sys.time()`
+
+```{r params, include=FALSE}
+unlockBinding("params", env=.GlobalEnv) # allow updates to parameters
+if (!dir.exists(params$out_dir) && dir.exists(file.path(params$base_dir, params$out_dir)))
+  params$out_dir <- file.path(params$base_dir, params$out_dir)
+if (!file.exists(params$deseq2_rds) && file.exists(file.path(params$base_dir, params$deseq2_rds)))
+  params$deseq2_rds <- file.path(params$base_dir, params$deseq2_rds)
+```
+
+## Input data
+
+Reading data from: `r params$deseq2_rds`
+
+```{r input_data}
+data.ds <- readRDS(params$deseq2_rds)
+coldata <- as.data.frame(colData(data.ds))
+stopifnot(all(params$plot_vars %in% names(coldata)))
+```
+
+### Sample annotations
+
+```{r sample_table}
+make.table(coldata, "samples", rownames=FALSE)
+```
+
+### Counts
+
+```{r filter_counts, message=FALSE}
+## remove genes with low counts:
+## (see https://bioconductor.org/packages/release/bioc/vignettes/DESeq2/inst/doc/DESeq2.html#pre-filtering)
+deseq.file <- file.path(params$out_dir, "DESeq2_filtered.rds")
+if (params$reuse_output && file.exists(deseq.file)) { # load previous DESeq2 results
+  unfiltered <- rownames(data.ds)
+  data.ds <- readRDS(deseq.file)
+  keep <- unfiltered %in% rownames(data.ds)
+} else { # filter counts and run DESeq2
+  ## size of smallest group in experimental design:
+  if (is.character(params$group_size)) {
+    group.size <- length(unique(as.character(coldata[[params$group_size]])))
+  } else group.size <- params$group_size
+  keep <- rowSums(counts(data.ds) >= 10) >= group.size
+  data.ds <- DESeq(data.ds[keep, ])
+  saveRDS(data.ds, deseq.file)
+}
+
+raw.counts <- counts(data.ds, normalized=FALSE)
+norm.counts <- counts(data.ds, normalized=TRUE)
+vsd <- varianceStabilizingTransformation(data.ds, blind=FALSE) # TODO: 'blind=TRUE'?
+```
+
+`r sum(!keep)` genes with low counts were filtered out.
+`r sum(keep)` genes remain.
+
+Gene-level counts have been normalized and variance-stabilized, then standardized per gene (to Z-scores) for visualization.
+The 500 genes with highest variance are shown.
+
+```{r heatmap, fig.dim=c(16, 9), warning=FALSE}
+mat <- assay(vsd)
+vars <- rowVars(mat, na.rm=TRUE)
+ann.row <- coldata[, params$plot_vars]
+## make sure no other plotting device is open, or 'pheatmap' will plot to that instead of to the HTML report!
+pheatmap(t(mat[order(vars, decreasing=TRUE)[1:500], ]), fontsize_col=3, scale="column", treeheight_col=0,
+         annotation_row=ann.row)
+## 'pheatmap(...)' fails to produce a plot if it's at the very end of a chunk!
+## TODO: add table of normalized counts (for download)? - may be too big
+```
+
+
+## Quality control
+
+### DESeq2 model convergence
+
+```{r deseq_converge, results="asis", comment=""}
+n.conv <- sum(mcols(data.ds)$betaConv, na.rm=TRUE)
+n.nonconv <- nrow(data.ds) - n.conv
+if (n.nonconv == 0) {
+  cat("No DESeq2 convergence failures.\n\n")
+} else {
+  cat("DESeq2 failed to converge for ", n.nonconv, " genes (", round(n.nonconv / nrow(data.ds) * 100, 1), "%).\n\n",
+      sep="")
+}
+```
+
+### Distribution of counts {.tabset}
+
+RLE ("relative log expression") plots show log-ratios of gene-level counts in each sample relative to a reference (defined as the median across all samples).
+Ideally, the distributions should be centered around the zero line and tightly spread.
+
+#### Raw data
+
+```{r rle_raw}
+plotRLE <- function(counts, color.by=NULL, range=c(-2, 2)) {
+  ruv::ruv_rle(t(log2(counts + 1)), color.by, ylim = range) +
+    theme(axis.title.x = element_text(), axis.title.y = element_text(angle=90)) + # restore axis titles
+    labs(x="sample", y="relative log expression")
+}
+
+plotRLE(raw.counts, coldata$subject)
+```
+
+#### Normalized data
+
+```{r rle_norm}
+plotRLE(norm.counts, coldata$subject)
+```
+
+### Principal component analysis {.tabset}
+
+Principal component analysis (PCA) transforms a dataset into a new coordinate system.
+The new coordinates ("principal components") correspond to (orthogonal) directions of decreasing variance in the data.
+
+The plots below are based on gene-level counts, after normalization and variance stabilization.
+They show the first two principal components, i.e. they map the multi-dimensional gene expression data from each sample into the two-dimensional space that captures most of the variation between samples.
+
+```{r pca, results="asis"}
+for (var in params$plot_vars) {
+  cat("#### Colour:", var, "\n\n")
+  print(plotPCA(vsd, var) + theme_bw() + labs(color=var))
+  cat("\n\n")
+}
+```
+
+
+<!-- DGE results for different comparisons -->
+
+```{r dge, results="asis", warning=FALSE}
+if (!params$no_gsea) { # prepare datasets once for GSEA
+  reactome.mapping <- suppressMessages(bitr(rownames(data.ds), "SYMBOL", "ENTREZID", org.Hs.eg.db, FALSE))
+  gsea.names <- c(GO.BP="Gene Ontology (Biological Process)", GO.MF="Gene Ontology (Molecular Function)",
+                  Reactome="Reactome pathways", Hallmark="MSigDB Hallmark sets")
+}
+## create and include child document for each contrast:
+options(knitr.duplicate.label="allow") # otherwise error when child document is used multiple times
+parts <- lapply(names(params$contrasts), function(contrast.name)
+  knitr::knit_child("STC15_Tempus_DGE_contrast.Rmd", envir=environment(), quiet=TRUE))
+cat(unlist(parts), sep="\n")
+```
