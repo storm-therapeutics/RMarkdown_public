@@ -1,0 +1,170 @@
+## Comparison: `r contrast.name`
+
+```{r dge_intro, results="asis"}
+contrast <- params$contrasts[[contrast.name]]
+if (length(contrast) == 3) {
+  cat("This analysis compares samples where \"", contrast[1], "\" is \"**", contrast[2],
+      "**\" to samples where \"", contrast[1], "\" is \"**", contrast[3], "**\" (reference).\n\n", sep="")
+  groups <- contrast[-1]
+} else if (length(contrast) == 2) {
+  cat("This analysis compares condition \"**", contrast[[1]], "**\" to condition \"**", contrast[[2]],
+      "**\" (reference).\n\n", sep="")
+  groups <- unlist(contrast)
+} else if (length(contrast) == 1) {
+  cat("This analysis compares condition \"**", contrast[[1]], "**\" to the reference condition.\n\n", sep="")
+  groups <- c(contrast[[1]], "reference")
+}
+cat("- A positive log fold change (\"upregulation\") means: higher gene expression in the \"", groups[1],
+    "\" group compared to the \"", groups[2], "\" group.\n\n", sep="")
+cat("- A negative log fold change (\"downregulation\") means: higher gene expression in the \"", groups[2],
+    "\" group compared to the \"", groups[1], "\" group.\n\n", sep="")
+```
+
+```{r dge_res}
+res <- results(data.ds, contrast=contrast)
+res.ord <- as.data.frame(res[order(res$pvalue), ])
+opts <- list(columnDefs = list(list(orderable=TRUE, targets=0)), # allow sorting by row name (gene)
+             order = list(list(5, "asc"))) # order by p-value by default
+## TODO: generate different filenames for different contrasts
+make.table(res.ord, "dge_results", options=opts, height="100%", width="100%") %>%
+  formatRound("baseMean", 1) %>%
+  formatRound(2:ncol(res.ord), 3)
+```
+
+### Overview (MA plot)
+
+Ideally, housekeeping genes and control probes are spread tightly around the horizontal "zero" line.
+
+```{r ma_plot}
+plotMA.annotated(res, gene.categories, legend.pos="topright", ylim=c(-2, 2))
+```
+
+### Volcano plot
+
+The cut-offs shown in the plot are:
+
+- FDR-adjusted p-value: 0.1
+
+- fold change: `r params$volcano_fc` (up)/`r format(1/params$volcano_fc, digits=2)` (down)
+
+Low-abundance genes without adjusted p-values (due to independent filtering performed by DESeq2) are not included in the plot.
+
+```{r volcano}
+## TODO: remove control probes?
+ind <- !is.na(res$padj)
+EnhancedVolcano(res[ind, ], lab=rownames(res)[ind], x="log2FoldChange", y="padj",
+                xlim=range(res$log2FoldChange), ylim=c(0, max(-log10(res[ind, "padj"]), na.rm=TRUE)),
+                pCutoff=0.1, FCcutoff=log2(params$volcano_fc), title="", subtitle="",
+                xlab=bquote(~log[2] ~ "fold change"), ylab=bquote(~-log[10] ~ p[adj]),
+                legendPosition="none", labSize=4)
+```
+
+```{r top_genes, eval=(length(contrast) == 3), results="asis"}
+cat("\n\n### Top genes\n\n")
+## TODO: exclude control probes?
+res.part <- res.ord[1:params$plot_top_degs, ]
+genes <- rownames(res.part)
+samples <- rownames(coldata)[coldata[[contrast[1]]] %in% contrast[-1]]
+plot.data <- as.data.frame(norm.counts[genes, samples])
+plot.data$gene <- factor(rownames(plot.data), levels=rownames(plot.data)) # preserve order of genes
+plot.data <- pivot_longer(plot.data, !gene, names_to="sample", values_to="norm_counts")
+plot.data$group <- factor(coldata[plot.data$sample, contrast[1]], levels=c(contrast[3], contrast[2]))
+
+## labels <- paste0(seq_along(genes), ". ", genes, "\nLFC: ", format(res.part$log2FoldChange, digits=2),
+##                  ", q: ", format(res.part$padj, digits=2))
+## TODO: is this worth it just to get the gene names in bold?
+labels <- paste0("atop(\"", seq_along(genes), ".\"~bold(\"", genes, "\"), \"LFC:\"~",
+                 format(res.part$log2FoldChange, digits=2), "*\", q:\"~", format(res.part$padj, digits=2), ")")
+names(labels) <- genes
+plot.data$label <- factor(labels[plot.data$gene], levels=labels) # preserve order
+
+ggplot(plot.data, aes(group, norm_counts)) +
+  geom_boxplot() +
+  geom_point(alpha=0.5) +
+  ## facet_wrap(vars(gene), scales="free_y", labeller=labeller(gene=labels)) +
+  facet_wrap(vars(label), scales="free_y", labeller=label_parsed) +
+  ## expand_limits(y=1) +
+  scale_y_log10() +
+  labs(x=contrast[1], y="normalized counts (log scale)")
+```
+
+```{r no_gsea, eval=params$no_gsea}
+knitr::knit_exit(fully=FALSE) # stop here
+```
+
+### Gene set enrichments {.tabset}
+
+Using a significance threshold of `r params$gsea_pmax` (FDR-adjusted p-value).
+Plots show up to 15 top hits.
+`(+)` and `(-)` after a term indicate enrichment at the top and bottom, respectively, of the gene list ranked by differential expression.
+Typically this corresponds to enrichment among upregulated/downregulated genes (as long as enough changes in both directions are detected -- see gene-level results above).
+
+```{r gsea, results="asis", warning=FALSE}
+gsea.file <- file.path(params$out_dir, paste0("GSEA_", paste(unlist(contrast), collapse="-"), ".rds"))
+if (params$reuse_output && file.exists(gsea.file)) { # load previous GSEA results
+  gsea.res <- readRDS(gsea.file)
+} else { # run GSEA
+  scores <- get.gsea.input(res, real.genes)
+  scores.fixed <- fix.nanostring.genes(scores, fix.names=TRUE)
+  gsea.res <- suppressMessages(gsea.all(scores.fixed, "", plot=FALSE, reactome.mapping=reactome.mapping,
+                                        species=params$species, pvalue.cutoff=params$gsea_pmax))
+  saveRDS(gsea.res, file=gsea.file)
+}
+
+for (id in names(gsea.res)) {
+  cat("\n\n####", gsea.names[id], "\n\n")
+  if (nrow(gsea.res[[id]]) == 0) {
+    cat("No hits\n\n")
+  } else {
+    print(dotplot.direction(gsea.res[[id]], label_format=50, font.size=10)) # + labs(title=follow.ups[i]))
+
+    cat("<details>\n<summary>Show table</summary>\n\n") # hide table by default
+    ## workaround to print table inside for-loop:
+    df <- as.data.frame(gsea.res[[id]])
+    opts <- list(order = list(list(6, "asc")), # order by p-value by default
+                 pageLength = 5, # show fewer resuls by default
+                 scrollX = TRUE, # horizontal scrolling
+                 scrollCollapse = TRUE)
+    filename <- paste0("GSEA_", sub(".", "-", id, fixed=TRUE))
+    cat(knitr::knit_print(make.table(df, filename, options=opts, height="100%", width="100%", rownames=FALSE) %>%
+                          formatRound(4:8, 3)))
+    ## %>% formatStyle(colnames(df), "white-space"="nowrap")))
+    cat("</details>\n\n")
+  }
+}
+```
+
+### {.tabset}
+
+```{r gsea_io360, results="asis", warning=FALSE}
+gsea.file <- file.path(params$out_dir, paste0("GSEA_IO360_", paste(unlist(contrast), collapse="-"), ".rds"))
+if (params$reuse_output && file.exists(gsea.file)) { # load previous GSEA results
+  gsea.res.io360 <- readRDS(gsea.file)
+} else { # run GSEA
+  gsea.res.io360 <- suppressMessages(lapply(io360.sets, function(gene.sets)
+    gsea.custom(scores, gene.sets, pvalue.cutoff=params$gsea_pmax)))
+  saveRDS(gsea.res.io360, file=gsea.file)
+}
+
+for (id in names(gsea.res.io360)) {
+  cat("\n\n####", gsea.names[id], "\n\n")
+  if (nrow(gsea.res.io360[[id]]) == 0) {
+    cat("No hits\n\n")
+  } else {
+    print(dotplot.direction(gsea.res.io360[[id]], label_format=50, font.size=10)) # + labs(title=follow.ups[i]))
+
+    cat("<details>\n<summary>Show table</summary>\n\n") # hide table by default
+    ## workaround to print table inside for-loop:
+    df <- as.data.frame(gsea.res.io360[[id]])
+    opts <- list(order = list(list(6, "asc")), # order by p-value by default
+                 pageLength = 5, # show fewer resuls by default
+                 scrollX = TRUE, # horizontal scrolling
+                 scrollCollapse = TRUE)
+    filename <- paste0("GSEA_", sub(".", "-", id, fixed=TRUE))
+    cat(knitr::knit_print(make.table(df, filename, options=opts, height="100%", width="100%", rownames=FALSE) %>%
+                          formatRound(4:8, 3)))
+    ## %>% formatStyle(colnames(df), "white-space"="nowrap")))
+    cat("</details>\n\n")
+  }
+}
+```

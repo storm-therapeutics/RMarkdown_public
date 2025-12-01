@@ -1,0 +1,255 @@
+---
+title: NanoString differential gene expression report
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float:
+      collapsed: true
+      smooth_scroll: false
+params:
+  base_dir: "C:/Users/hendrik.weisser/OneDrive - Storm Therapeutics/Data/Mouse_Nanostring"
+  out_dir: "" # directory for output files (GSEA results)
+  deseq2_rds: "DESeq2.rds"
+  contrasts: null # list of contrasts to extract from DESeq2 results
+  io360_xlsx: "2024-12-12_LBL-10545-01_PanCancer_Mouse_IO_360_Panel.xlsx"
+  io360_gene_sheet: "Gene Details" # human panel: "Gene and Probe Details"
+  io360_io_sheet: "Annotations" # human panel: "Cancer-Immunity Cycle"
+  single_var: "" # column annotation from DESeq2 to use for all "..._var[s]" arguments
+  heatmap_vars: "" # column annotations from DESeq2 results to include in heatmaps
+  pca_vars: "" # column annotations from DESeq2 results to use for PCA plot colors
+  rle_var: "" # single column annotation from DESeq2 results to use for RLE plot colors
+  volcano_fc: 1.5 # fold-change cut-off for volcano plots
+  plot_top_degs: 12
+  species: "mouse" # TODO: infer from data?
+  no_gsea: false # skip GSEA (slow)?
+  gsea_pmax: 0.1 # adj. p-value cut-off for GSEA
+  reuse_output: false
+---
+<!-- move content to the left -->
+<style>
+.main-container {
+    max-width: 100% !important;
+}
+</style>
+
+<!-- avoid blank space to the right of TOC: -->
+```{js page_format, echo=FALSE}
+// from:
+// https://www.reddit.com/r/rstats/comments/qlbst0/comment/jsg550p
+
+// TOC column
+const TOC_col = document.querySelector('div.row>div:not(div+div)');  // First div element under div.row
+TOC_col.classList.replace('col-sm-4', 'col-sm-2');  // sm: Change TOC column width from 33% to 17% of total
+TOC_col.classList.replace('col-md-3', 'col-md-2');  // md: Change TOC column width from 25% to 17% of total
+
+// Main column
+const main_col = document.querySelector('div.row>div+div');  // Second (and last) div element under div.row
+main_col.classList.replace('col-sm-8', 'col-sm-10');  // sm: Change main column width from 67% to 83% of total
+main_col.classList.replace('col-md-9', 'col-md-10');  // md: Change main column width from 75% to 83% of total
+main_col.classList.add('col-sm-offset-2', 'col-md-offset-2')  // sm+md: offset main column by width of TOC
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=FALSE)
+library(knitr)
+## library(dplyr) # for 'select'
+library(DT) # add data download buttons to tables
+library(DESeq2)
+library(pheatmap)
+library(EnhancedVolcano) # used in child document 'nanostring_dge_contrast.Rmd'
+## pathway/enrichment analysis:
+if (params$species == "human") {
+  library(org.Hs.eg.db)
+} else if (params$species == "mouse") {
+  library(org.Mm.eg.db)
+} else stop("Species ", params$species, " not supported")
+library(ReactomePA)
+library(msigdbr)
+
+source("nanostring_functions.R")
+source("../BiomarkerDiscoveryToolkit/R/enrichment.R") # for GSEA
+## ggplot theme:
+theme_set(theme_bw() + theme(plot.title=element_text(hjust=0.5, face="bold"), plot.subtitle=element_text(hjust=0.5)))
+
+## wrapper function to create table with CSV download button:
+make.table <- function(data, filename, options=list(), ...) {
+  ## if only showing one button, need an extra 'list(...)' in the 'buttons' argument:
+  opts <- c(dom="Bfrtip", buttons=list(list(list(extend="csv", filename=filename))), options)
+  datatable(data, extensions="Buttons", options=opts, ...)
+}
+```
+
+`r Sys.time()`
+
+```{r params, include=FALSE}
+unlockBinding("params", env=.GlobalEnv) # allow updates to parameters
+if (!dir.exists(params$out_dir) && dir.exists(file.path(params$base_dir, params$out_dir)))
+  params$out_dir <- file.path(params$base_dir, params$out_dir)
+if (!file.exists(params$io360_xlsx) && file.exists(file.path(params$base_dir, params$io360_xlsx)))
+  params$io360_xlsx <- file.path(params$base_dir, params$io360_xlsx)
+if (!file.exists(params$deseq2_rds) && file.exists(file.path(params$base_dir, params$deseq2_rds)))
+  params$deseq2_rds <- file.path(params$base_dir, params$deseq2_rds)
+if (params$single_var != "") {
+  if (params$heatmap_vars == "") params$heatmap_vars <- params$single_var
+  if (params$pca_vars == "") params$pca_vars <- params$single_var
+  if (params$rle_var == "") params$rle_var <- params$single_var
+}
+```
+
+## Input data
+
+Reading data from: **`r params$deseq2_rds`**
+
+Reading panel metadata from: `r params$io360_xlsx`
+
+```{r input_data}
+data.ds <- readRDS(params$deseq2_rds)
+coldata <- as.data.frame(colData(data.ds))
+raw.counts <- counts(data.ds, normalized=FALSE)
+norm.counts <- counts(data.ds, normalized=TRUE)
+vsd <- varianceStabilizingTransformation(data.ds, blind=FALSE) # TODO: 'blind=TRUE'?
+## apply batch correction ('limma::removeBatchEffect') if RUVg factors are included in 'coldata':
+with.ruvg <- any(grepl("^W_\\d+$", names(coldata)))
+if (with.ruvg) {
+  norm.counts.batch <- norm.counts
+  vsd.batch <- vsd
+  norm.counts <- remove.batch.effects(norm.counts, coldata)
+  assay(vsd) <- remove.batch.effects(assay(vsd), coldata, is.log=TRUE)
+}
+
+gene.info <- get.io360.gene.info(params$io360_xlsx, params$io360_gene_sheet)
+gene.categories <- rep("", nrow(raw.counts))
+names(gene.categories) <- rownames(raw.counts)
+stopifnot(all(gene.info$"Official Symbol" %in% names(gene.categories)))
+gene.categories[gene.info$"Official Symbol"] <- gene.info$Category
+gene.categories[grep("^NEG_", names(gene.categories))] <- "Negative"
+gene.categories[grep("^POS_", names(gene.categories))] <- "Positive"
+stopifnot(!any(gene.categories == ""))
+```
+
+### Sample annotations
+
+```{r sample_table}
+## exclude "sizeFactor" column added by DESeq2:
+make.table(coldata[, names(coldata) != "sizeFactor"], "samples")
+```
+
+### Counts {.tabset}
+
+Gene-level counts have been normalized and variance-stabilized.
+
+#### No clustering/scaling
+
+Genes are ordered by average expression level (in each probe category).
+
+```{r heatmap1, fig.dim=c(16, 9)}
+mat <- assay(vsd)
+ord <- order(gene.categories[rownames(mat)], -rowMeans(mat))
+ann.col <- data.frame(category=gene.categories[rownames(mat)], row.names=rownames(mat))
+ann.row <- if (params$heatmap_vars != "") coldata[, params$heatmap_vars, drop=FALSE] else NA
+pheatmap(t(mat[ord, ]), cluster_rows=FALSE, cluster_cols=FALSE, fontsize_col=3,
+         gaps_col=cumsum(table(gene.categories)), annotation_col=ann.col, annotation_row=ann.row)
+## TODO: use 'ComplexHeatmap::pheatmap' instead for more customization options?
+## TODO: add table of counts (for download)?
+```
+
+#### With clustering/scaling
+
+Counts are standardized per gene (to Z-scores) for visualization.
+Control probes are excluded but housekeeping genes are kept.
+
+```{r heatmap2, fig.dim=c(16, 9)}
+ind <- names(gene.categories)[gene.categories %in% c("Endogenous", "Housekeeping")]
+pheatmap(t(mat[ind, ]), fontsize_col=3, scale="column", treeheight_col=0, annotation_col=ann.col, annotation_row=ann.row)
+## 'pheatmap(...)' fails to produce a plot if it's at the very end of a chunk!
+## TODO: add table of normalized counts (for download)?
+```
+
+
+## Quality control
+
+### Distribution of counts {.tabset}
+
+RLE ("relative log expression") plots show log-ratios of gene-level counts in each sample relative to a reference (defined as the median across all samples).
+Ideally, the distributions should be centered around the zero line and tightly spread.
+
+#### Raw data
+
+```{r rle_raw}
+plotRLE(raw.counts, coldata[[params$rle_var]])
+```
+
+```{r rle_norm, results="asis"}
+if (with.ruvg) {
+  cat("\n\n#### Normalized data (before batch correction)\n\n")
+  print(plotRLE(norm.counts.batch, coldata[[params$rle_var]]))
+  cat("\n\n#### Normalized data (after batch correction)\n\n")
+} else cat("\n\n#### Normalized data\n\n")
+plotRLE(norm.counts, coldata[[params$rle_var]])
+```
+
+### Principal component analysis {.tabset}
+
+Principal component analysis (PCA) transforms a dataset into a new coordinate system.
+The new coordinates ("principal components") correspond to (orthogonal) directions of decreasing variance in the data.
+
+The plots below show the first two principal components, i.e. they map the multi-dimensional gene expression data from each sample into the two-dimensional space that captures most of the variation between samples.
+We expect to see clustering of samples by group in the "all genes" plots, but not in the "control genes only" plots (where clustering could indicate batch effects).
+
+#### All genes, raw data
+
+```{r pca_raw}
+raw <- SummarizedExperiment(log2(raw.counts + 1), colData=coldata)
+plotPCA(DESeqTransform(raw), params$pca_vars, Inf)
+```
+
+```{r pca_norm, results="asis"}
+if (with.ruvg) {
+  cat("\n\n#### All genes, normalized data (before batch correction)\n\n")
+  print(plotPCA(vsd.batch, params$pca_vars, Inf))
+  cat("\n\n#### All genes, normalized data (after batch correction)\n\n")
+} else cat("\n\n#### All genes, normalized data\n\n")
+plotPCA(vsd, params$pca_vars, Inf)
+```
+
+```{r pca_break, eval=with.ruvg, results="asis"}
+cat("\n\n### {.tabset}\n\n") # break up tabs into two rows if we have before/after batch correction
+```
+
+#### Control genes only, raw data
+
+```{r pca_raw_ctrl}
+control.genes <- names(gene.categories)[gene.categories != "Endogenous"]
+plotPCA(DESeqTransform(raw[control.genes, ]), params$pca_vars, Inf)
+```
+
+```{r pca_norm_ctrl, results="asis"}
+if (with.ruvg) {
+  cat("\n\n#### Control genes only, normalized data (before batch correction)\n\n")
+  print(plotPCA(vsd.batch[control.genes, ], params$pca_vars, Inf))
+  cat("\n\n#### Control genes only, normalized data (after batch correction)\n\n")
+} else cat("\n\n#### Control genes only, normalized data\n\n")
+plotPCA(vsd[control.genes, ], params$pca_vars, Inf)
+```
+
+
+<!-- DGE results for different comparisons -->
+
+```{r dge, results="asis", warning=FALSE}
+if (!params$no_gsea) { # prepare datasets once for GSEA
+  real.genes <- names(gene.categories)[gene.categories %in% c("Endogenous", "Housekeeping")]
+  org.db <- if (params$species == "human") org.Hs.eg.db else org.Mm.eg.db
+  reactome.mapping <- suppressMessages(bitr(real.genes, "SYMBOL", "ENTREZID", org.db, FALSE))
+  gsea.names <- c(GO.BP="Gene Ontology (Biological Process)", GO.MF="Gene Ontology (Molecular Function)",
+                  Reactome="Reactome pathways", Hallmark="MSigDB Hallmark sets",
+                  cancerimmunity="IO 360: Cancer immunity", functional="IO 360: Functional annotations",
+                  celltypes="IO 360: Cell type")
+  io360.sets <- get.io360.gene.sets(params$io360_xlsx, io.sheet=params$io360_io_sheet)
+}
+## create and include child document for each contrast:
+options(knitr.duplicate.label="allow") # otherwise error when child document is used multiple times
+parts <- lapply(names(params$contrasts), function(contrast.name)
+  knitr::knit_child("nanostring_dge_contrast.Rmd", envir=environment(), quiet=TRUE))
+cat(unlist(parts), sep="\n")
+```
