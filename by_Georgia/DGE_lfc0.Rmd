@@ -1,0 +1,652 @@
+---
+output: html_document
+params:
+  title: "RNA-seq analysis report" # document title
+  input_dir: "testpath" # directory containing input files
+  output_dir: "" # directory for outputs (will be created)
+  counts_file: "salmon.merged.gene_counts.tsv" # file containing gene-level counts (relative to 'input_dir')
+  sampleinfo_file: "" # file containing sample information (relative to 'input_dir')
+  control_name: "A549_DMSO_D1" # name of control condition
+  treatment_name: "" # name of treatment condition (default: use all non-control conditions)
+  species: "human" # species - human or mouse
+title: "`r params$title`"
+author: "Georgia Tsagkogeorga"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+
+---
+
+```{r setup, include=FALSE}
+species <- params$species ###set species for BioMart setting, currently supported "human" and "mouse"
+if (species == "human") {
+  library(org.Hs.eg.db)
+} else if (species == "mouse") {
+  library(org.Mm.eg.db)
+} else {
+  stop("unsupported species: ", species)
+}
+
+library(captioner) # removed from CRAN, available here: https://github.com/adletaw/captioner
+library(DT)
+library(biomaRt)
+library(dplyr)
+library(DESeq2)
+library(magrittr)
+library(pheatmap)
+library(ggplot2)
+library(plotly)
+library(htmltools)
+library(clusterProfiler)
+library(DOSE)
+
+```
+
+## Differential Expression Analysis
+
+Differential expression analysis is performed using the package [DESeq2](http://bioconductor.org/packages/release/bioc/html/DESeq2.html) v.`r packageVersion("DESeq2")`. The standard RNA-seq workflow includes the following steps:
+
+* Input data: import sample table and count matrix
+* Pre-filtering: remove genes with low counts
+* Exploratory analyses:
+  +  Transformation of count data using regularized log transformation or variance stabilizing transformation
+  +  Quality assessment using heatmaps of sample-to-sample distances, Principal Component Analysis (PCA) and gene clustering analysis
+* Differential expression analysis:
+  + Log fold change, *p*-value and adjusted *p*-value estimation
+  + Visualization using MA and Volcano plots
+
+
+```{r, echo=FALSE}
+figs <- captioner(prefix="Figure")
+tbls <- captioner(prefix="Table")
+```
+
+\
+\
+\
+\
+
+### Input Data
+
+#### Sample information
+```{r, echo=FALSE}
+dir <- params$input_dir # input directory
+control <- params$control_name # control name
+treatment <- params$treatment_name # treatment name (optional)
+
+outputdir <- params$output_dir # output directory
+if (outputdir == "") {
+  outputdir <- file.path(dir, control)
+}
+
+counts <- params$counts_file # counts file i.e. salmon counts file name
+
+sample_info <- params$sampleinfo_file # sample info table (e.g. nf-core/rnaseq input)
+if (sample_info == "") { # find sample info file at default location
+  sample_info <- list.files(dir, pattern = "_sample_info.csv")
+  sample_info <- grep(control, sample_info, value=TRUE) # checks if sample_info is correctly sourced
+  if (length(sample_info) == 0) stop("Sample info file not found")
+}
+
+sampleTable <- read.csv(file.path(dir, sample_info), check.names = F, comment.char = "#")
+if (!("sample" %in% names(sampleTable))) { # old or new format?
+  sampleTable$sample <- paste0(sampleTable$group, "_R", sampleTable$replicate)
+}
+## remove duplicate sample names (e.g. if sample was sequenced in multiple lanes):
+sampleTable <- sampleTable[!duplicated(sampleTable$sample), ]
+rownames(sampleTable) <- sampleTable$sample
+
+conditions <- levels(factor(sampleTable$group))
+if (!(control %in% conditions)) stop("Control condition not found in sample info")
+if (treatment != "") { # treatment condition given explicitly
+  if (!(treatment %in% conditions)) stop("Treatment condition not found in sample info")
+  ## keep only relevant samples:
+  sampleTable <- sampleTable[sampleTable$group %in% c(treatment, control), ]
+}
+
+```
+
+**`r tbls("Sample_Info", "Sample information table.")`**
+The control condition is set to "`r control`".
+
+The treatment condition is `r ifelse(treatment != "", paste0("set to \"", treatment, "\""), "not set")`.
+
+```{r, echo=FALSE, warning=FALSE}
+datatable(sampleTable, rownames = FALSE,
+          extensions = 'Buttons',
+          #filter = "top",
+          options = list(
+            dom = 'Bfrtip',
+            buttons = 'csv',
+            scrollX = TRUE,
+            scrollCollapse = TRUE
+          ))
+```
+
+\
+\
+\
+\
+
+#### Read count data
+The DESeq2 package takes as input a matrix of **un-normalized or estimated counts** of sequencing reads (for single-end RNA-seq) or fragments (for paired-end RNA-seq). The value in the *i*-th row and the *j*-th column of the matrix tells how many reads from RNA-seq or another high-throughput sequencing experiment can be assigned to gene *i* in sample *j*.
+
+<!-- This information is outdated: -->
+<!-- Read counts for each gene of the human genome (provided in the reference gencode.v31.annotation.gtf file) have been generated using [featureCounts](http://bioinf.wehi.edu.au/featureCounts/) from the subread package, as implemented in the nextflow [nf-co.re/rnaseq](https://nf-co.re/rnaseq) pipeline. -->
+
+\
+\
+\
+
+
+**`r tbls("Count_matrix", "Raw count matrix preview.")`**
+```{r, include = FALSE}
+countsTable <- read.csv(file.path(dir, counts), sep="\t", comment.char = '#', row.names = "gene_id", check.names = F)
+if (length(grep("\\.", colnames(countsTable))) > 0)
+{
+   replace <- stringi::stri_replace_all_fixed(colnames(countsTable)[grep("\\.", colnames(countsTable))], ".", "-")
+   colnames(countsTable)[(grep("\\.", colnames(countsTable)))] <- replace
+}
+
+counts_matrix <- countsTable %>% mutate_if(is.numeric, round)
+rownames(counts_matrix) <- rownames(countsTable)
+## consider relevant samples only:
+counts_matrix <- counts_matrix[, rownames(sampleTable)]
+
+stopifnot(all(rownames(sampleTable) %in% colnames(counts_matrix)))
+stopifnot(all(rownames(sampleTable) == colnames(counts_matrix)))
+counts_matrix <- counts_matrix[rowSums(counts_matrix) > 0, ]
+
+##connection to Ensembl sometimes fails
+##resetting the html should solve this
+#httr::set_config(httr::config(ssl_verifypeer = FALSE))
+
+##selecting human or mouse bioMart
+if ( species == "human" ) {
+  GOterm_db <- org.Hs.eg.db
+  human <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+  annot <- getBM(attributes=c("ensembl_gene_id", "entrezgene_id", "external_gene_name", "description"),
+                 filters = "ensembl_gene_id",
+                 values = sub("\\..*", "", rownames(counts_matrix)),
+                 mart = human)
+} else if ( species == "mouse" ) {
+  GOterm_db <- org.Mm.eg.db
+  ## mouse <- useMart("ENSEMBL_MART_ENSEMBL", dataset = "mmusculus_gene_ensembl", verbose = TRUE)
+  mouse <- useMart("ensembl", dataset = "mmusculus_gene_ensembl")
+  annot <- getBM(attributes=c("ensembl_gene_id", "entrezgene_id", "external_gene_name", "description"),
+                 filters = "ensembl_gene_id",
+                 values = sub("\\..*", "", rownames(counts_matrix)),
+                 mart = mouse)
+}
+
+count_table <- as.data.frame(counts_matrix)
+count_table$Ensembl <- as.character(sub("\\..*", "", rownames(counts_matrix)))
+count_table$Gene <- annot[match(count_table$Ensembl, annot$ensembl_gene_id), "external_gene_name"]
+count_table <- count_table[, c(((ncol(count_table)-1):ncol(count_table)), (1:(ncol(count_table)-2)))]
+
+```
+
+
+```{r, echo=FALSE, warning=FALSE}
+datatable(count_table, rownames = FALSE,
+          extensions = 'FixedColumns',
+          #filter = "top",
+          options = list(
+            dom = 'Bfrtip',
+            buttons = 'csv',
+            scrollX = TRUE,
+            scrollCollapse = TRUE)
+          )
+```
+
+*Please note that the DESeq2 model internally corrects for library size, so transformed or normalized values such as counts scaled by library size should not be used as input.*
+
+\
+\
+\
+\
+
+### Pre-filtering
+
+The starting point of the analysis is to construct a DESeqDataSet object to store the read counts and the intermediate estimated quantities during statistical analysis. The DESeqDataSet object has an associated design formula, here defined as *~ Condition*. The design formula expresses the variables which are used in modeling, and is used for estimating the dispersions and the log2 fold changes of the model.
+
+```{r, echo=FALSE, include=FALSE}
+names(annot) <- c("Ensembl", "Entrez", "Gene", "Description")
+genes <- annot[!duplicated(annot$Ensembl),]
+
+dds <- DESeqDataSetFromMatrix(countData = counts_matrix,
+                              colData = sampleTable,
+                              design = ~ group)
+
+genes <- genes[match(sub("\\..*", "", rownames(dds)), genes$Ensembl),]
+mcols(dds) <- cbind(mcols(dds), genes)
+
+```
+
+
+
+A minimal pre-filtering step is performed to keep only genes that have at least 10 reads total. Note that more strict filtering is automatically applied via independent filtering on the mean of normalized counts within the results function of DESeq2.
+
+
+**Number of genes in the input count matrix: `r nrow(dds)` **
+```{r, echo=FALSE}
+dds$group <- relevel(dds$group, ref = control)
+dds <- dds[ rowSums(counts(dds)) > 10, ] # drop rows with zero and low counts sum
+```
+**Number of genes after filtering for low counts: `r nrow(dds)` **
+
+\
+\
+\
+\
+
+### Exploratory analyses
+
+#### Count data transformation
+For downstream exploratory analyses, count data are transformed on the *log2* scale, which has been normalized with respect to library size or other normalization factors. The goal is to remove the dependence of the variance on the mean, particularly the high variance of the logarithm of count data when the mean is low.
+
+DESeq2 offers two types of data transformations:
+
++ variance stabilizing transformations (VST) (Tibshirani 1988; Huber et al. 2003; Anders and Huber 2010), suitable for medium-to-large datasets (*n* > 30)
++ the regularized logarithm or *rlog* (Love, Huber, and Anders 2014), suitable for small datasets (*n* < 30)
+
+Here, **the sampling size *n* is `r length(sampleTable$sample)`**, and **count data have been transformed using *`r ifelse(length(sampleTable$sample) < 30, "rlog", "VST")`* **
+
+\
+\
+\
+\
+
+#### Data quality assessment
+Prior testing for differential gene expression, a quality check is performed to detect any outliers among the samples.
+\
+\
+\
+
+```{r, include=FALSE}
+if ( length(sampleTable$sample) < 30 ) {
+  rld <- rlog(dds, blind = FALSE)
+} else {
+  rld <- vst(dds, blind = FALSE)
+}
+```
+
+**`r figs("Heatmap1","Heatmap of the sample-to-sample distances.")`**
+```{r, echo=FALSE}
+# Calculate euclidean distance across samples
+sampleDists <- dist(t(assay(rld)))
+sampleDistMatrix <- as.matrix( sampleDists )
+rownames(sampleDistMatrix) <- dds$group
+colnames(sampleDistMatrix) <- dds$sample
+```
+
+```{r, echo = FALSE, out.width='70%', fig.height=7, fig.align='center'}
+pheatmap(sampleDistMatrix,
+         clustering_distance_rows = sampleDists,
+         clustering_distance_cols = sampleDists,
+         #fontsize_row = 8,
+         #fontsize_col = 8,
+         fontsize = 10
+        )
+```
+
+\
+\
+
+**`r figs("PCA","PCA plot.")`**
+
+```{r, echo=FALSE}
+pcaData <- plotPCA(rld, intgroup = "group", returnData = TRUE)
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+```
+
+```{r, echo = FALSE, out.width='75%', fig.align='center'}
+pcaPlot <- ggplot(pcaData, aes(x = PC1, y = PC2, color = group)) +
+  geom_point(size = 3) +
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+  theme(text = element_text(size=10))
+print(pcaPlot)
+```
+
+\
+\
+\
+
+
+**`r figs("Heatmap2","Hierarchical clustering of the top 80 most variable genes.")`**
+
+```{r, echo=FALSE, out.width='100%', fig.height=8, fig.align='center'}
+topVarGenes <- head(order(rowVars(assay(rld)), decreasing = TRUE), 80)
+mat <- assay(rld)[ topVarGenes, ]
+mat <- mat - rowMeans(mat)
+anno <- as.data.frame(colData(rld)[, c("sample", "group")])
+rownames(anno) <- anno$sample
+
+## converting ENSEMBL id to gene name for easier interpretation (beware of duplicated entries!)
+mapping <- unique(annot[which( annot$Ensembl %in% rownames(mat) ), c("Gene", "Ensembl")])
+rownames(mapping) <- mapping$Ensembl
+
+rownames(mat) <- mapping[rownames(mat), "Gene"]
+pheatmap(mat, annotation_col = anno, show_colnames = FALSE, fontsize = 6)
+
+```
+
+\
+\
+\
+\
+
+### Differential expression analysis
+DESeq function performs a default analysis through the steps:
+
+ + estimation of size factors: estimateSizeFactors
+ + estimation of dispersion: estimateDispersions
+ + Negative Binomial GLM fitting and Wald statistics: nbinomWaldTest
+  resultsNames(dds)
+\
+\
+
+
+```{r, include=FALSE}
+dds <- DESeq(dds)
+resultsNames(dds)
+
+```
+
+**`r figs("Dispersion","Estimated per-gene dispersion.")`**
+```{r, echo=FALSE, fig.align='center', out.width='60%'}
+plotDispEsts(dds, cex=0.2)
+```
+
+
+```{r, echo=FALSE, results='asis', message=FALSE, fig.align='center', warning=FALSE}
+l <- browsable(tagList())
+p <- tagList()
+i <- 1
+
+tables_dir <- file.path(outputdir, "tables")
+plots_dir <- file.path(outputdir, "plots")
+if (!dir.exists(tables_dir)) {
+  dir.create(tables_dir, recursive = TRUE)
+}
+if (!dir.exists(plots_dir)) {
+  dir.create(plots_dir, recursive = TRUE)
+}
+
+for ( treatment in levels(dds$group)[-1] ) {
+  res_treatment_ctrl <- results(dds, contrast=c("group", treatment , control))
+  ##attaching Entrez, Gene and Description column to DESEq2 columns
+  res_treatment_ctrl <- cbind(mcols(dds)[match(rownames(res_treatment_ctrl), rownames(mcols(dds))), c("Entrez", "Gene", "Description")], res_treatment_ctrl)
+  res_treatment_ctrl$Ensembl <- rownames(res_treatment_ctrl)
+  res_treatment_ctrl <- res_treatment_ctrl[,c(10,1:9)]
+
+  write.table(res_treatment_ctrl[ order(res_treatment_ctrl$log2FoldChange, decreasing = TRUE), ], paste0(tables_dir, "/", treatment, "_vs_", control, "_DESeq2.tsv"), sep="\t", row.names = FALSE, quote=FALSE)
+  resSig_treatment_ctrl <- subset(res_treatment_ctrl, padj < 0.1)
+  if ( nrow(resSig_treatment_ctrl) > 0 ){
+    write.table(resSig_treatment_ctrl[ order(resSig_treatment_ctrl$log2FoldChange, decreasing = TRUE), ], paste0(tables_dir, "/", treatment, "_vs_", control, "_DESeq2_FDR.1.tsv"), sep="\t", row.names = FALSE, quote=FALSE)
+  }
+  resSig_treatment_ctrl_0.05_1  <- subset(res_treatment_ctrl, padj < 0.05 & abs(log2FoldChange) > 1)
+  if ( nrow(resSig_treatment_ctrl_0.05_1) > 0 ){
+    write.table(resSig_treatment_ctrl_0.05_1[ order(resSig_treatment_ctrl_0.05_1$log2FoldChange, decreasing = TRUE), ], paste0(tables_dir, "/", treatment, "_vs_", control, "_DESeq2_FDR.05_abslfc1.tsv"), sep="\t", row.names = FALSE, quote=FALSE)
+  }
+
+  # Volcano plots
+  res_treatment_ctrl$Description <- NULL
+  res_treatment<-res_treatment_ctrl[!is.na(res_treatment_ctrl$padj), ]
+  cols <- densCols(res_treatment$log2FoldChange, -log10(res_treatment$pvalue))
+
+  alpha <- 0.05 # Threshold on the adjusted p-value
+  lfc <- 0 # cut-off LFC
+  pxlim <- max(3, abs(max(res_treatment$log2FoldChange)))
+
+  gn.selected <- abs(res_treatment$log2FoldChange) > lfc & res_treatment$padj < alpha
+
+  # Select genes for GO enrichment
+  gn.up <- as.character(unique(res_treatment[res_treatment$log2FoldChange > lfc & res_treatment$padj < alpha, "Entrez"]))
+  gn.down <- as.character(unique(res_treatment[res_treatment$log2FoldChange < -lfc & res_treatment$padj < alpha, "Entrez"]))
+  gn.all <- c(gn.up, gn.down)
+  genelist <- as.character(unique(res_treatment$Entrez))
+
+  ## GO enrichment analysis function
+  GO_enrichment <- function(DE_genelist, deg="all", ont="BP") {
+    enrichGO_DE <- enrichGO(gene = DE_genelist,
+                            universe = genelist,
+                            OrgDb = GOterm_db,
+                            ont = ont,
+                            readable = TRUE)
+    if ( dim(data.frame(enrichGO_DE))[1] != 0 ){
+      write.table(enrichGO_DE, paste0(tables_dir, "/", treatment, "_", deg, "_DEGs_GO_", ont, "_FDR.05_abslfc", lfc, ".tsv"), row.names = FALSE, sep="\t", quote = FALSE)
+      enrichGO_simplified<-simplify(enrichGO_DE, cutoff=0.7, by="p.adjust", select_fun=min)
+      write.table(enrichGO_simplified, paste0(tables_dir, "/", treatment, "_", deg, "_DEGs_GO_", ont, "_FDR.05_abslfc", lfc, "_simplified.tsv"), row.names = FALSE, sep="\t", quote = FALSE)
+      # Dotplot and enrichment map of top 50 terms
+      if ( dim(data.frame(enrichGO_DE))[1] > 2 ){
+        plot_enrichGO <- dotplot(enrichGO_DE, showCategory=50, order="p.adjust", font.size=8)
+        ggsave(paste0(plots_dir, "/", treatment, "_", deg, "_DEGs_GO_", ont, "_FDR.05_abslfc", lfc, ".dotplot.pdf"), plot_enrichGO, width=3, height=3, scale=3)
+      }
+    }
+    return(data.frame(enrichGO_DE))
+  }
+
+  GO_up <- GO_enrichment(gn.up, deg = "up")
+  GO_down <- GO_enrichment(gn.down, deg = "down")
+  GO_all <- GO_enrichment(gn.all, deg = "all")
+
+  l[[i]] <- tags$div(
+    tags$h5(paste0(treatment, " vs ", control)),
+    tags$hr(),
+    tags$p(
+      paste0("Number of Differentially Expressed Genes (DEGs): ", dim(res_treatment[abs(res_treatment$log2FoldChange) > lfc & res_treatment$padj < alpha,])[1]), tags$br(),
+      paste0("Up-regulated: ", dim(res_treatment[res_treatment$log2FoldChange > lfc & res_treatment$padj < alpha,])[1], "; Down-regulated: ", dim(res_treatment[res_treatment$log2FoldChange < -lfc & res_treatment$padj < alpha,])[1]),
+      tags$br(),
+      paste0("|LFC|>", lfc, "; FDR<", alpha)
+    ),
+    tags$b(figs(paste0("Volcano", i), paste0("Volcano plot ", treatment, "."))),
+    plot_ly(as.data.frame(res_treatment), type = 'scatter', mode = 'markers') %>%
+      layout(
+        xaxis = list(range = c(-pxlim,pxlim), title = "Log-Fold Change"),
+        yaxis = list(range = c(0, max(-log10(res_treatment$padj))), title = "-log10(P-adj)"),
+        font = list(size = 10),
+        autosize = T) %>%
+      add_trace(
+        x = res_treatment$log2FoldChange,
+        y = -log10(res_treatment$padj),
+        marker = list(color=cols),
+        text = res_treatment$Gene,
+        hovertemplate = paste('<b>%{text}</b>',
+                              '<br>-log10(<i>P-adj</i>): %{y:.2f}',
+                              '<br>LFC: %{x:.2f}<br>'
+        ),
+        showlegend = F
+      ) %>%
+      add_trace(
+        x = res_treatment$log2FoldChange[gn.selected],
+        y = -log10(res_treatment$padj)[gn.selected],
+        marker = list(color="red"),
+        text = res_treatment$Gene[gn.selected],
+        hovertemplate = paste('<b>%{text}</b>',
+                              '<br>-log10(<i>P-adj</i>): %{y:.2f}',
+                              '<br>LFC: %{x:.2f}<br>'
+        ),
+        showlegend = F
+      ),
+    tags$br(),
+    tags$b(tbls(paste0("DE_results", i), paste0(treatment, " vs ", control, "."))),
+    tags$br(),
+    tags$br(),
+    datatable(data.frame(res_treatment),
+              rownames = FALSE,
+              extensions = 'Buttons',
+              #filter = "top",
+              options = list(
+                dom = 'Bfrtip',
+                buttons = 'csv',
+                scrollX = TRUE,
+                scrollCollapse = TRUE
+              )) %>% formatRound(columns=c(4:9), digits=4),
+    tags$br(),
+    tags$br(),
+    tags$br(),
+    tags$br(),
+    tags$br(),
+    tags$br(),
+    tags$b(tbls(paste0("GO_results_up", i), paste0("GO enrichment UP-regulated genes ", treatment, " (LFC>", lfc, "; FDR<", alpha, ")."))),
+    tags$br(),
+    tags$br(),
+    if ( dim(data.frame(GO_up))[1] != 0 ){
+      datatable(data.frame(GO_up),
+                rownames = FALSE,
+                extensions = 'Buttons',
+                #filter = "top",
+                options = list(
+                  dom = 'Bfrtip',
+                  buttons = 'csv',
+                  scrollX = TRUE,
+                  scrollCollapse = TRUE
+                )) %>% formatRound(columns=c(5:7), digits=4) %>%
+        formatStyle("Description","white-space"="nowrap")
+    }
+    else {
+      tags$p("No significant results.")
+    },
+    tags$br(),
+    tags$br(),
+    tags$br(),
+    tags$br(),
+    tags$br(),
+    tags$br(),
+    if ( dim(GO_up)[1] > 5 ){
+      tags$b(figs(paste0("GO_dotplot_up", i), paste0("Top GO results UP-regulated genes ", treatment, " (LFC>", lfc, "; FDR<", alpha, ").")))
+    },
+    if ( dim(GO_up)[1] > 5 ){
+      GO_up <- head(GO_up, n = 20)
+      plot_ly(GO_up, type = 'scatter', mode = 'markers', color = "red") %>%
+        layout(
+          xaxis = list(title = "Gene ratio"),
+          font = list(size = 12),
+          height = 450,
+          margin = list(l=300),
+          autosize = T) %>%
+        add_trace(
+
+          x = GO_up$Count / as.numeric(sub(".*/", "", GO_up$GeneRatio)),
+          y = GO_up$Description,
+          text = paste('Count:', GO_up$Count, '<br>q-value:', sprintf("%.4f", GO_up$qvalue)),
+          showlegend = F
+        )
+    },
+    tags$br(),
+    tags$br(),
+    tags$br(),
+    tags$b(tbls(paste0("GO_results_down", i), paste0("GO enrichment DOWN-regulated genes ", treatment, " (LFC<", -lfc, "; FDR<", alpha, ")."))),
+    tags$br(),
+    tags$br(),
+    if ( dim(data.frame(GO_down))[1] != 0 ){
+      datatable(data.frame(GO_down),
+                rownames = FALSE,
+                extensions = 'Buttons',
+                #filter = "top",
+                options = list(
+                  dom = 'Bfrtip',
+                  buttons = 'csv',
+                  scrollX = TRUE,
+                  scrollCollapse = TRUE
+                )) %>% formatRound(columns=c(5:7), digits=4) %>%
+        formatStyle("Description","white-space"="nowrap")
+    }
+    else {
+      tags$p("No significant results.")
+    },
+    tags$br(),
+    tags$br(),
+    tags$br(),
+    tags$br(),
+    tags$br(),
+    tags$br(),
+    if ( dim(GO_down)[1] > 5 ){
+      tags$b(figs(paste0("GO_dotplot_down", i), paste0("Top GO results DOWN-regulated genes ", treatment, " (LFC<", -lfc, "; FDR<", alpha, ").")))
+    },
+    if ( dim(GO_down)[1] > 5 ){
+      GO_down <- head(GO_down, n = 20)
+      plot_ly(GO_down, type = 'scatter', mode = 'markers', color = "red") %>%
+        layout(
+          xaxis = list(title = "Gene ratio"),
+          #yaxis = list(title = "Enriched GO terms"),
+          font = list(size = 12),
+          height = 450,
+          margin = list(l=200),
+          autosize = T) %>%
+        add_trace(
+
+          x = GO_down$Count / as.numeric(sub(".*/", "", GO_down$GeneRatio)),
+          y = GO_down$Description,
+          #color = GO_down$Count,
+          #marker = list(color = GO_down$Count),
+          text = paste('Count:', GO_down$Count, '<br>q-value:', sprintf("%.4f", GO_down$qvalue)),
+          showlegend = F
+        )
+    },
+    tags$br(),
+    tags$br(),
+    tags$br(),
+    tags$b(tbls(paste0("GO_results_all", i), paste0("GO enrichment ALL differentially expressed genes ", treatment, " (|LFC|>", lfc, "; FDR<", alpha, ")."))),
+    tags$br(),
+    tags$br(),
+    if ( dim(data.frame(GO_all))[1] != 0 ){
+      datatable(data.frame(GO_all),
+                rownames = FALSE,
+                extensions = 'Buttons',
+                #filter = "top",
+                options = list(
+                  dom = 'Bfrtip',
+                  buttons = 'csv',
+                  scrollX = TRUE,
+                  scrollCollapse = TRUE
+                )) %>% formatRound(columns=c(5:7), digits=4) %>%
+        formatStyle("Description","white-space"="nowrap")
+    }
+    else {
+      tags$p("No significant results.")
+    },
+    tags$br(),
+    tags$br(),
+    tags$br(),
+    tags$br(),
+    tags$br(),
+    tags$br(),
+    if ( dim(GO_all)[1] > 5 ){
+      tags$b(figs(paste0("GO_dotplot_all", i), paste0("Top GO results ALL-regulated genes ", treatment, " (|LFC|>", lfc, "; FDR<", alpha, ").")))
+    },
+    if ( dim(GO_all)[1] > 5 ){
+      GO_all <- head(GO_all, n=20)
+      plot_ly(GO_all, type = 'scatter', mode = 'markers', color = "red") %>%
+        layout(
+          xaxis = list(title = "Gene ratio"),
+          #yaxis = list(title = "Enriched GO terms"),
+          font = list(size = 12),
+          height = 450,
+          margin = list(l=200),
+          autosize = T) %>%
+        add_trace(
+
+          x = GO_all$Count / as.numeric(sub(".*/", "", GO_all$GeneRatio)),
+          y = GO_all$Description,
+          #color = GO_all$Count,
+          #marker = list(color = GO_all$Count),
+          text = paste('Count:', GO_all$Count, '<br>q-value:', sprintf("%.4f", GO_all$qvalue)),
+          showlegend = F
+        )
+    },
+    tags$br(),
+    tags$br(),
+    tags$br(),
+    tags$br(),
+    tags$br(),
+    tags$br(),
+    tags$br()
+  )
+  i <- i + 1
+}
+```
+
+```{r, echo=FALSE, warning=FALSE, fig.align='center', out.width='80%'}
+l
+```
